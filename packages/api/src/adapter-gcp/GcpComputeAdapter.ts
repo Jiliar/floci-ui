@@ -39,6 +39,7 @@ const OPERATION_POLL_INTERVAL_MS = 100
 const DEFAULT_DISK_SIZE_GB = 10
 const HEALTH_PATH = '/_floci-gcp/health'
 const HEALTH_TTL_MS = 5_000
+const HEALTH_TIMEOUT_MS = 2_000
 const DEFAULT_NETWORK = 'default'
 /** The auto-mode subnet ranges real GCP assigns to each region's `default` subnet. */
 const DEFAULT_SUBNET_RANGES: Record<string, string> = {
@@ -94,7 +95,8 @@ export class GcpComputeAdapter implements CloudServiceAdapter {
      * `compute` in their health report. Only a successful health report that omits
      * it marks the service unavailable. An unreachable or unparseable health leaves
      * it available, since runtime reachability is reported separately and a probe
-     * failure must not hide a service that works.
+     * failure must not hide a service that works. The probe is bounded by its own
+     * timeout so a stalled health request cannot block service discovery.
      */
     async resolveDescriptorOverride(): Promise<CloudServiceDescriptorOverride> {
         if (await this.runtimeServesCompute()) return {}
@@ -109,7 +111,9 @@ export class GcpComputeAdapter implements CloudServiceAdapter {
 
         let value = true
         try {
-            const health = await this.client.json<{services?: Record<string, unknown>}>(HEALTH_PATH)
+            const health = await this.client.json<{services?: Record<string, unknown>}>(HEALTH_PATH, {
+                signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+            })
             if (health?.services && typeof health.services === 'object') value = 'compute' in health.services
         } catch {
             value = true

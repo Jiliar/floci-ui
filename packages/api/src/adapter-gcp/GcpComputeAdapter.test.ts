@@ -342,6 +342,16 @@ describe('GcpComputeAdapter', () => {
             expect(await adapter().resolveDescriptorOverride()).toEqual({})
         })
 
+        test('gives up on a stalled health request and stays available', async () => {
+            globalThis.fetch = ((_url: string | URL | Request, init?: RequestInit) =>
+                new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener('abort', () => reject(init.signal?.reason))
+                })) as unknown as typeof fetch
+            const started = Date.now()
+            expect(await adapter().resolveDescriptorOverride()).toEqual({})
+            expect(Date.now() - started).toBeLessThan(4_000)
+        }, 6_000)
+
         test('memoizes the probe briefly', async () => {
             const calls = stubFetch(health({compute: 'running'}))
             const instance = adapter()
