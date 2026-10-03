@@ -196,7 +196,7 @@ AWS only, through the unified shell plus AWS-specific panels where the workflow 
 
 Current gaps:
 
-- GCP Compute Engine lists, inspects, creates and deletes instances, but needs a `floci/floci-gcp` build that serves Compute Engine (`nightly`); the 0.9.0 release has no `/compute/v1` routes. Creation needs an existing custom-mode network and subnetwork. Start, stop and reset are implemented in the adapter but not yet exposed by the generic resource actions route.
+- GCP Compute Engine lists, inspects, creates and deletes instances, but needs a `floci/floci-gcp` build that serves Compute Engine (`nightly`); the 0.9.0 release has no `/compute/v1` routes. Creation without a network uses the `default` network and the region's `default` subnet, creating them (custom-mode, as the runtime has no auto-mode) when missing; a custom network needs an explicit subnetwork. Start, stop and reset are implemented in the adapter but not yet exposed by the generic resource actions route.
 - Compute creation still uses an AWS-specific panel because it needs dependent selectors.
 
 </details>

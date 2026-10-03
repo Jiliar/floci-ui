@@ -1,4 +1,4 @@
-import {NotFoundError, RuntimeError, ValidationError} from '../cloud-spi/errors'
+import {ConflictError, NotFoundError, RuntimeError, ValidationError} from '../cloud-spi/errors'
 import {
     GCP_COMPUTE_ZONES,
     GCP_INSTANCE_NAME_PATTERN,
@@ -36,6 +36,12 @@ const COMPUTE_PREFIX = '/compute/v1/projects'
 const OPERATION_POLL_ATTEMPTS = 20
 const OPERATION_POLL_INTERVAL_MS = 100
 const DEFAULT_DISK_SIZE_GB = 10
+const DEFAULT_NETWORK = 'default'
+/** The auto-mode subnet ranges real GCP assigns to each region's `default` subnet. */
+const DEFAULT_SUBNET_RANGES: Record<string, string> = {
+    'us-central1': '10.128.0.0/20',
+    'europe-west1': '10.132.0.0/20',
+}
 
 interface GceNetworkInterface {
     network?: string
@@ -106,10 +112,13 @@ export class GcpComputeAdapter implements CloudServiceAdapter {
         }
         const zone = requiredOneOf(input.values.zone, GCP_COMPUTE_ZONES, 'zone')
         const machineType = requiredOneOf(input.values.machineType, GCP_MACHINE_TYPES, 'machineType')
-        const network = requiredString(input.values.network, 'network')
-        const subnetwork = requiredString(input.values.subnetwork, 'subnetwork')
         const diskSizeGb = diskSize(input.values.diskSizeGb)
         const region = regionOfZone(zone)
+        const {network, subnetwork} = await this.resolveNetworking(
+            region,
+            optionalString(input.values.network),
+            optionalString(input.values.subnetwork),
+        )
 
         const operation = await this.client.json<GceOperation>(`${this.zonePath(zone)}/instances`, {
             method: 'POST',
@@ -126,7 +135,7 @@ export class GcpComputeAdapter implements CloudServiceAdapter {
                 ],
             }),
         })
-        await this.waitForOperation(zone, operation)
+        await this.waitForOperation(this.zonePath(zone), operation)
 
         const created = await this.get(`${zone}/${name}`)
         if (!created) throw new RuntimeError(`Instance ${name} was created but could not be read back`)
@@ -156,14 +165,89 @@ export class GcpComputeAdapter implements CloudServiceAdapter {
         if (!res) throw new NotFoundError(`Instance ${id} was not found`)
     }
 
-    private async waitForOperation(zone: string, operation: GceOperation | null): Promise<void> {
+    /**
+     * GCP puts new instances on the `default` VPC when none is named, and a
+     * subnetwork alone implies its network. The runtime only implements
+     * custom-mode networks, so a missing `default` is created as custom-mode with
+     * the region's well-known subnet range. A custom network with no subnetwork
+     * has nothing to place the instance in, so that is a 400 as on real GCP.
+     */
+    private async resolveNetworking(
+        region: string,
+        network: string | undefined,
+        subnetwork: string | undefined,
+    ): Promise<{network: string; subnetwork: string}> {
+        if (!network && subnetwork) {
+            const existing = await this.client.json<{network?: string}>(
+                `${this.regionPath(region)}/subnetworks/${encodeURIComponent(subnetwork)}`,
+                {method: 'GET'},
+                {emptyOnNotFound: true},
+            )
+            if (!existing) throw new ValidationError(`subnetwork ${subnetwork} does not exist in region ${region}`)
+            return {network: lastSegment(existing.network) || DEFAULT_NETWORK, subnetwork}
+        }
+
+        const resolvedNetwork = network ?? DEFAULT_NETWORK
+        if (resolvedNetwork === DEFAULT_NETWORK && (!subnetwork || subnetwork === DEFAULT_NETWORK)) {
+            await this.ensureDefaultNetwork(region)
+            return {network: DEFAULT_NETWORK, subnetwork: DEFAULT_NETWORK}
+        }
+        if (!subnetwork) {
+            throw new ValidationError(`subnetwork is required for custom-mode network ${resolvedNetwork}`)
+        }
+        return {network: resolvedNetwork, subnetwork}
+    }
+
+    private async ensureDefaultNetwork(region: string): Promise<void> {
+        const cidr = DEFAULT_SUBNET_RANGES[region]
+        if (!cidr) throw new ValidationError(`No default subnet range is known for region ${region}`)
+
+        const globalPath = `${this.projectPath()}/global`
+        await this.createIfMissing(`${globalPath}/networks`, DEFAULT_NETWORK, globalPath, {
+            name: DEFAULT_NETWORK,
+            autoCreateSubnetworks: false,
+        })
+        await this.createIfMissing(`${this.regionPath(region)}/subnetworks`, DEFAULT_NETWORK, this.regionPath(region), {
+            name: DEFAULT_NETWORK,
+            network: `global/networks/${DEFAULT_NETWORK}`,
+            ipCidrRange: cidr,
+        })
+    }
+
+    /** Insert unless present; a concurrent creator winning the race is not an error. */
+    private async createIfMissing(
+        collectionPath: string,
+        name: string,
+        operationScopePath: string,
+        body: Record<string, unknown>,
+    ): Promise<void> {
+        const existing = await this.client.fetch(
+            `${collectionPath}/${encodeURIComponent(name)}`,
+            {method: 'GET'},
+            {emptyOnNotFound: true},
+        )
+        if (existing) return
+
+        try {
+            const operation = await this.client.json<GceOperation>(collectionPath, {
+                method: 'POST',
+                headers: {'content-type': 'application/json'},
+                body: JSON.stringify(body),
+            })
+            await this.waitForOperation(operationScopePath, operation)
+        } catch (error) {
+            if (!(error instanceof ConflictError)) throw error
+        }
+    }
+
+    private async waitForOperation(scopePath: string, operation: GceOperation | null): Promise<void> {
         const name = operation?.name
         if (!name) return
 
         let current: GceOperation | null = operation
         for (let attempt = 0; attempt < OPERATION_POLL_ATTEMPTS && current?.status !== 'DONE'; attempt++) {
             await sleep(OPERATION_POLL_INTERVAL_MS)
-            current = await this.client.json<GceOperation>(`${this.zonePath(zone)}/operations/${encodeURIComponent(name)}`)
+            current = await this.client.json<GceOperation>(`${scopePath}/operations/${encodeURIComponent(name)}`)
         }
 
         const failure = current?.error?.errors?.[0]?.message
@@ -173,6 +257,10 @@ export class GcpComputeAdapter implements CloudServiceAdapter {
 
     private projectPath(): string {
         return `${COMPUTE_PREFIX}/${encodeURIComponent(this.client.project)}`
+    }
+
+    private regionPath(region: string): string {
+        return `${this.projectPath()}/regions/${encodeURIComponent(region)}`
     }
 
     private zonePath(zone: string): string {
@@ -237,6 +325,10 @@ function regionOfZone(zone: string): string {
 function requiredString(value: unknown, field: string): string {
     if (typeof value !== 'string' || !value.trim()) throw new ValidationError(`${field} is required`)
     return value.trim()
+}
+
+function optionalString(value: unknown): string | undefined {
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
 function requiredOneOf<T extends string>(value: unknown, allowed: readonly T[], field: string): T {

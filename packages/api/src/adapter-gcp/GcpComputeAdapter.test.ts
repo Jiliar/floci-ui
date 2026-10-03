@@ -185,4 +185,114 @@ describe('GcpComputeAdapter', () => {
         expect(calls.map((call) => call.url.split('/').pop())).toEqual(['start', 'stop', 'reset'])
         expect(calls.every((call) => call.init?.method === 'POST')).toBe(true)
     })
+
+    describe('network defaults', () => {
+        const noNetwork = {name: 'vm1', zone: 'us-central1-a', machineType: 'e2-standard-2'}
+        const notFound = () => json({error: {code: 404, message: 'not found'}}, 404)
+
+        /** Runtime where `existing` URLs answer 200 on GET and everything else is missing. */
+        function runtime(existing: string[], onPost?: (url: string) => Response | undefined) {
+            return stubFetch((url, init) => {
+                const path = url.replace(ENDPOINT, '')
+                if (init?.method === 'POST') {
+                    const override = onPost?.(path)
+                    if (override) return override
+                    return json(operation('DONE'))
+                }
+                if (path.includes('/operations/')) return json(operation('DONE'))
+                if (path.endsWith('/instances/vm1')) return json(gceInstance('vm1'))
+                return existing.includes(path) ? json({name: 'x'}) : notFound()
+            })
+        }
+
+        const net = `${PROJECT_PATH}/global/networks/default`
+        const subnet = (region: string) => `${PROJECT_PATH}/regions/${region}/subnetworks/default`
+
+        test('with no network or subnetwork, creates the default VPC and regional subnet when missing', async () => {
+            const calls = runtime([])
+
+            await adapter().create({values: noNetwork})
+
+            const posts = calls.filter((call) => call.init?.method === 'POST')
+            expect(posts.map((call) => call.url.replace(ENDPOINT, ''))).toEqual([
+                `${PROJECT_PATH}/global/networks`,
+                `${PROJECT_PATH}/regions/us-central1/subnetworks`,
+                `${PROJECT_PATH}/zones/us-central1-a/instances`,
+            ])
+            expect(JSON.parse(String(posts[0].init?.body))).toEqual({name: 'default', autoCreateSubnetworks: false})
+            expect(JSON.parse(String(posts[1].init?.body))).toEqual({
+                name: 'default',
+                network: 'global/networks/default',
+                ipCidrRange: '10.128.0.0/20',
+            })
+            expect(JSON.parse(String(posts[2].init?.body)).networkInterfaces).toEqual([
+                {network: 'global/networks/default', subnetwork: 'regions/us-central1/subnetworks/default'},
+            ])
+        })
+
+        test('uses the region-specific default range outside us-central1', async () => {
+            const calls = runtime([net])
+
+            await adapter().create({values: {...noNetwork, zone: 'europe-west1-b'}})
+
+            const subnetPost = calls.find((call) => call.url.endsWith('/regions/europe-west1/subnetworks'))
+            expect(JSON.parse(String(subnetPost?.init?.body)).ipCidrRange).toBe('10.132.0.0/20')
+        })
+
+        test('does not recreate default resources that already exist', async () => {
+            const calls = runtime([net, subnet('us-central1')])
+
+            await adapter().create({values: noNetwork})
+
+            const posts = calls.filter((call) => call.init?.method === 'POST')
+            expect(posts.map((call) => call.url.replace(ENDPOINT, ''))).toEqual([
+                `${PROJECT_PATH}/zones/us-central1-a/instances`,
+            ])
+        })
+
+        test('tolerates a concurrent creator winning the race with a 409', async () => {
+            runtime([], (path) =>
+                path.endsWith('/global/networks') ? json({error: {code: 409, message: 'exists'}}, 409) : undefined,
+            )
+            const resource = await adapter().create({values: noNetwork})
+            expect(resource.id).toBe('us-central1-a/vm1')
+        })
+
+        test('network default without a subnetwork behaves like no networking at all', async () => {
+            const calls = runtime([net, subnet('us-central1')])
+            await adapter().create({values: {...noNetwork, network: 'default'}})
+            expect(calls.filter((call) => call.init?.method === 'POST')).toHaveLength(1)
+        })
+
+        test('a custom network without a subnetwork is rejected like GCP does', async () => {
+            const calls = stubFetch(() => json({}))
+            await expect(adapter().create({values: {...noNetwork, network: 'my-vpc'}})).rejects.toBeInstanceOf(
+                ValidationError,
+            )
+            expect(calls).toHaveLength(0)
+        })
+
+        test('a subnetwork alone takes its network from the subnetwork', async () => {
+            const calls = stubFetch((url, init) => {
+                if (init?.method === 'POST') return json(operation('DONE'))
+                if (url.includes('/subnetworks/my-subnet')) return json({name: 'my-subnet', network: `${SELF}/global/networks/my-vpc`})
+                if (url.includes('/operations/')) return json(operation('DONE'))
+                return json(gceInstance('vm1'))
+            })
+
+            await adapter().create({values: {...noNetwork, subnetwork: 'my-subnet'}})
+
+            const post = calls.find((call) => call.init?.method === 'POST')
+            expect(JSON.parse(String(post?.init?.body)).networkInterfaces).toEqual([
+                {network: 'global/networks/my-vpc', subnetwork: 'regions/us-central1/subnetworks/my-subnet'},
+            ])
+        })
+
+        test('a subnetwork that does not exist is a validation error', async () => {
+            stubFetch(() => json({error: {code: 404, message: 'not found'}}, 404))
+            await expect(adapter().create({values: {...noNetwork, subnetwork: 'ghost'}})).rejects.toBeInstanceOf(
+                ValidationError,
+            )
+        })
+    })
 })
