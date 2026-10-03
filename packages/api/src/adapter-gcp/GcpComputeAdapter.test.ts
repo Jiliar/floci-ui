@@ -295,4 +295,59 @@ describe('GcpComputeAdapter', () => {
             )
         })
     })
+
+    test('follows nextPageToken across aggregated pages before filtering', async () => {
+        const calls = stubFetch((url) =>
+            url.includes('pageToken=tok%201')
+                ? json({items: {'zones/us-central1-b': {instances: [gceInstance('web-2')]}}, nextPageToken: 'tok 2'})
+                : url.includes('pageToken=tok%202')
+                  ? json({items: {'zones/us-central1-c': {instances: [gceInstance('web-3')]}}})
+                  : json({items: {'zones/us-central1-a': {instances: [gceInstance('web-1')]}}, nextPageToken: 'tok 1'}),
+        )
+
+        const all = await adapter().list()
+        expect(all.map((resource) => resource.name)).toEqual(['web-1', 'web-2', 'web-3'])
+        expect(calls.map((call) => call.url.split('?')[1] ?? '')).toEqual(['', 'pageToken=tok%201', 'pageToken=tok%202'])
+
+        stubFetch((url) =>
+            url.includes('pageToken=')
+                ? json({items: {'zones/us-central1-b': {instances: [gceInstance('needle')]}}})
+                : json({items: {'zones/us-central1-a': {instances: [gceInstance('web-1')]}}, nextPageToken: 'next'}),
+        )
+        expect((await adapter().list({search: 'needle'})).map((resource) => resource.name)).toEqual(['needle'])
+    })
+
+    describe('runtime availability', () => {
+        const health = (services: Record<string, string>) => () => json({services, version: 'x'})
+
+        test('is available when the runtime health lists compute', async () => {
+            stubFetch(health({gke: 'running', compute: 'running'}))
+            expect(await adapter().resolveDescriptorOverride()).toEqual({})
+        })
+
+        test('is unavailable with a reason when health omits compute (floci-gcp 0.9.0)', async () => {
+            const calls = stubFetch(health({gke: 'running', cloudrun: 'running'}))
+            const override = await adapter().resolveDescriptorOverride()
+            expect(calls[0].url).toBe(`${ENDPOINT}/_floci-gcp/health`)
+            expect(override.availability).toBe('coming_soon')
+            expect(override.reason).toContain('floci-gcp:nightly')
+        })
+
+        test('stays available when health cannot be read', async () => {
+            stubFetch(() => {
+                throw new TypeError('connection refused')
+            })
+            expect(await adapter().resolveDescriptorOverride()).toEqual({})
+            stubFetch(() => new Response('not json', {status: 200}))
+            expect(await adapter().resolveDescriptorOverride()).toEqual({})
+        })
+
+        test('memoizes the probe briefly', async () => {
+            const calls = stubFetch(health({compute: 'running'}))
+            const instance = adapter()
+            await instance.resolveDescriptorOverride()
+            await instance.resolveDescriptorOverride()
+            expect(calls).toHaveLength(1)
+        })
+    })
 })
